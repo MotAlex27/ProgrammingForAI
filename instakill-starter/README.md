@@ -10,19 +10,25 @@ What the instructor provides (this starter):
 - `scripts/seed_db.py` — 5-10 synthetic users/posts
 - `tests/test_health.py` — test skeleton
 
-What it does **not** provide: the feed, ranking, ML models, search. Those are the team's work, in the following weeks.
+What it does **not** provide: CRUD, the feed, ranking, or ML models. Those are the team's work in following weeks.
 
 ## Running it
 
 ```bash
 pip install -e .
+python scripts/seed_db.py
 uvicorn app.main:app --reload
 # other terminal:
 curl localhost:8000/health
-
-python scripts/seed_db.py
+curl "localhost:8000/search?q=cosine%20similarity&limit=5"
 pytest
 ```
+
+## Semantic search
+
+`GET /search` embeds the seeded posts and builds an in-memory index during application startup. The CPU sentence encoder is loaded by `app/search/encoder.py`; SQLite reads stay in `app/repositories/post_repository.py`, while NumPy cosine scoring and deterministic top-*k* retrieval stay in `app/search/retrieval.py`. Seed the database before starting the app; a post inserted later is not in the current index. For now, restart the application after adding posts to rebuild it. A future write service can refresh or replace the index after a successful post commit.
+
+The first startup downloads `sentence-transformers/all-MiniLM-L6-v2`; subsequent runs use the local model cache. No hosted inference service or vector database is used.
 
 ## Milestones (see masterplan.md for full details)
 
