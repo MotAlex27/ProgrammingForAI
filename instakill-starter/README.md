@@ -21,8 +21,24 @@ uvicorn app.main:app --reload
 # other terminal:
 curl localhost:8000/health
 curl "localhost:8000/search?q=cosine%20similarity&limit=5"
+curl "localhost:8000/feed?user_id=1&limit=20&strategy=for_you"
 pytest
 ```
+
+## Week 4 feed
+
+`GET /feed` supports personalized ranking and a chronological baseline. Feed
+candidates are all posts, except the requesting user's own posts and posts they
+already liked; a user who follows nobody still sees other eligible posts. The
+ranking combines 72-hour exponential freshness, a followed-author affinity
+indicator, and normalized log like-count popularity, with default weights
+`0.4`, `0.4`, and `0.2`.
+
+Selecting the top `k` of `C` candidates uses a heap in `O(C log k)` time and
+`O(k)` auxiliary space, in addition to database reads and signal aggregation.
+Per-post like counts are the first derived values to precompute to avoid
+re-aggregating the likes table per request. Run all feed and existing checks
+with `pytest` from this repository directory.
 
 ## Semantic search
 

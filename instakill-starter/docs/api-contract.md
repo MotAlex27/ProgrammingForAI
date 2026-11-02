@@ -39,6 +39,64 @@ An empty index returns `200 OK` with an empty `results` list.
 
 - `422 Unprocessable Entity` when `q` is missing or blank, or when `limit` is missing, not an integer, or outside 1–20.
 
+## User feed
+
+`GET /feed?user_id=<int>&limit=<1..50>&strategy=for_you|chronological`
+
+### Request
+
+- `user_id` is required and identifies an existing user.
+- `limit` is optional, defaults to 20, and must be an integer from 1 through 50.
+- `strategy` is optional, defaults to `for_you`, and must be `for_you` or `chronological`.
+
+### Successful response
+
+`200 OK` returns up to `limit` posts. `for_you` results include a numeric `score` and
+are ordered by descending score, then ascending `post_id`. Chronological results are
+ordered by newest `created_at`, then ascending `post_id`; they omit `score`.
+
+```json
+{
+  "user_id": 1,
+  "strategy": "for_you",
+  "posts": [
+    {
+      "post_id": 3,
+      "user_id": 2,
+      "content": "just shipped a cosine similarity search, feels great",
+      "created_at": "2026-11-02T10:00:00+00:00",
+      "score": 0.72
+    }
+  ]
+}
+```
+
+Candidates are all existing posts because this starter has no post visibility
+field. The requesting user's own posts and posts they have already liked are
+excluded. A user who follows nobody can still receive other eligible posts; they
+receive no affinity boost.
+
+The `for_you` score is:
+
+```text
+0.4 * exp(-age_hours / 72)
++ 0.4 * followed_author
++ 0.2 * log(1 + post_like_count) / log(1 + max_like_count)
+```
+
+Here `followed_author` is 1 when the author is followed and 0 otherwise; the
+popularity term is 0 when there are no likes. The top-*k* ranker takes
+`O(C log k)` time and `O(k)` heap space for `C` candidates and requested limit
+`k`, after database reads and signal aggregation. The first derived value to
+precompute for larger datasets would be per-post like counts, avoiding a full
+like-table aggregation on every request.
+
+### Validation and error cases
+
+- `422 Unprocessable Entity` when `user_id` is missing or not an integer, when
+  `limit` is outside 1–50 or not an integer, or when `strategy` is unknown.
+- `404 Not Found` when `user_id` does not identify an existing user.
+
 ## Future endpoint: retrieve a user's post
 
 `GET /users/{user_id}/posts/{post_id}`
