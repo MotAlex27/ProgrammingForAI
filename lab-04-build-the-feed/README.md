@@ -16,7 +16,7 @@ This directory is the complete Week 4 package to post on Classroom.
 
 ## Compute policy
 
-The lab must run on CPU with the standard library and NumPy only; a GPU is not required. It uses MovieLens `latest-small` (about 1 MB): download the zip in your browser from the GroupLens link above and upload it to the notebook when asked — an automatic download from Python fails on GroupLens's certificate chain. You can also place the zip beside the notebook; the notebook extracts it into the standard `ml-latest-small/` folder. Alternatively, extract the archive there yourself, or place its correctly named `ratings.csv` and `movies.csv` beside the notebook. Do not commit the data. Do not use a hosted service or a paid API.
+The lab must run on CPU with the standard library and NumPy only; a GPU is not required. It uses MovieLens `latest-small` (about 1 MB). The `ml-latest-small.zip` archive is included beside the notebook so it can be rerun without another download; the notebook extracts it into the standard `ml-latest-small/` folder. If using a fresh copy without the archive, download it in your browser from the GroupLens link above and upload it to the notebook when asked — an automatic download from Python fails on GroupLens's certificate chain. Alternatively, extract the archive there yourself, or place its correctly named `ratings.csv` and `movies.csv` beside the notebook. The extracted dataset is not committed separately. Do not use a hosted service or a paid API.
 
 ## InstaKill requirement
 
