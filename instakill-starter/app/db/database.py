@@ -17,6 +17,19 @@ CREATE TABLE IF NOT EXISTS post (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS follow (
+    user_id INTEGER NOT NULL REFERENCES user(id),
+    followed_user_id INTEGER NOT NULL REFERENCES user(id),
+    PRIMARY KEY (user_id, followed_user_id),
+    CHECK (user_id != followed_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS like (
+    user_id INTEGER NOT NULL REFERENCES user(id),
+    post_id INTEGER NOT NULL REFERENCES post(id),
+    PRIMARY KEY (user_id, post_id)
+);
 """
 
 
