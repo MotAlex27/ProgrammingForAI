@@ -20,7 +20,7 @@ class FeedPostResponse(BaseModel):
 
 class FeedResponse(BaseModel):
     user_id: int
-    strategy: Literal["for_you", "chronological"]
+    strategy: Literal["for_you", "chronological", "learned"]
     posts: list[FeedPostResponse]
 
 
@@ -33,7 +33,7 @@ def get_feed(
     user_id: Annotated[int, Query()],
     service: Annotated[FeedService, Depends(get_feed_service)],
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
-    strategy: Annotated[Literal["for_you", "chronological"], Query()] = "for_you",
+    strategy: Annotated[Literal["for_you", "chronological", "learned"], Query()] = "for_you",
 ) -> FeedResponse:
     try:
         result = service.get_feed(user_id, limit, strategy)
