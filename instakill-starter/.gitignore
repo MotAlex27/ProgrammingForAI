@@ -1,4 +1,5 @@
 instakill.db
+instakill-eval.db
 __pycache__/
 *.pyc
 .pytest_cache/

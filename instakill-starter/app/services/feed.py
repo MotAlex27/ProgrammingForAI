@@ -112,6 +112,7 @@ class FeedService:
             Path.cwd() / "like_model.npz",
             Path(__file__).resolve().parents[2] / "like_model.npz",
             Path(__file__).resolve().parents[2] / "instakill-starter" / "like_model.npz",
+            Path(__file__).resolve().parents[3] / "lab-05" / "like_model.npz",
         ]
         for candidate in candidates:
             if candidate.exists():
@@ -126,81 +127,62 @@ class FeedService:
         limit: int,
     ) -> list[dict[str, int | str | float]]:
         if np is None:
-            return rank_feed(
-                candidates,
-                signals,
-                now,
-                DEFAULT_WEIGHTS,
-                limit,
-            )
+            raise RuntimeError("NumPy is required for the learned feed strategy.")
 
         model_path = FeedService._find_model_file()
         if model_path is None:
-            return rank_feed(
-                candidates,
-                signals,
-                now,
-                DEFAULT_WEIGHTS,
-                limit,
+            raise FileNotFoundError(
+                "The learned feed model was not found. Expected lab-05/like_model.npz."
             )
 
-        try:
-            model = np.load(model_path)
-            expected = list(model["features"])
-            if not expected:
-                raise ValueError("model did not include any features")
-            feature_order = list(expected)
-            row_vectors: list[list[float]] = []
-            for candidate in candidates:
-                created_at = _as_utc(candidate.post.created_at)
-                age_days = max(0.0, (_as_utc(now) - created_at).total_seconds() / 86400)
-                freshness = 0.5 ** (age_days / max(1.0, float(model.get("half_life_days", 1095.0))))
-                affinity = 1.0 if candidate.post.user_id in signals.followed_user_ids else 0.0
-                popularity = (
-                    math.log1p(candidate.like_count) / math.log1p(signals.max_like_count)
-                    if signals.max_like_count > 0
-                    else 0.0
-                )
-                activity = 0.5 if candidate.like_count > 0 else 0.0
-                lifetime = min(1.0, age_days / 3650.0)
-                age = min(1.0, age_days / 3650.0)
-                row = {
-                    "freshness": freshness,
-                    "affinity": affinity,
-                    "popularity": popularity,
-                    "activity": activity,
-                    "lifetime": lifetime,
-                    "age": age,
-                }
-                row_vectors.append([row.get(name, 0.0) for name in feature_order])
-            if not row_vectors:
-                return []
-            features = np.asarray(row_vectors, dtype=float)
-            x = (features - model["mu"]) / model["sd"]
-            hidden = np.tanh(x @ model["W1"] + model["b1"])
-            scores = 1.0 / (1.0 + np.exp(-(hidden @ model["W2"] + model["b2"])[:, 0]))
-            ranked = sorted(
-                range(len(candidates)),
-                key=lambda index: (-float(scores[index]), _post_id(candidates[index].post)),
-            )[:limit]
-            return [
-                {
-                    "post_id": _post_id(candidates[index].post),
-                    "user_id": candidates[index].post.user_id,
-                    "content": candidates[index].post.content,
-                    "created_at": _as_utc(candidates[index].post.created_at).isoformat(),
-                    "score": float(scores[index]),
-                }
-                for index in ranked
-            ]
-        except Exception:
-            return rank_feed(
-                candidates,
-                signals,
-                now,
-                DEFAULT_WEIGHTS,
-                limit,
+        model = np.load(model_path)
+        expected = list(model["features"])
+        if not expected:
+            raise ValueError("The learned feed model did not include any features.")
+        feature_order = list(expected)
+        row_vectors: list[list[float]] = []
+        for candidate in candidates:
+            created_at = _as_utc(candidate.post.created_at)
+            age_days = max(0.0, (_as_utc(now) - created_at).total_seconds() / 86400)
+            freshness = 0.5 ** (age_days / max(1.0, float(model.get("half_life_days", 1095.0))))
+            affinity = 1.0 if candidate.post.user_id in signals.followed_user_ids else 0.0
+            popularity = (
+                math.log1p(candidate.like_count) / math.log1p(signals.max_like_count)
+                if signals.max_like_count > 0
+                else 0.0
             )
+            activity = 0.5 if candidate.like_count > 0 else 0.0
+            lifetime = min(1.0, age_days / 3650.0)
+            age = min(1.0, age_days / 3650.0)
+            row = {
+                "freshness": freshness,
+                "affinity": affinity,
+                "popularity": popularity,
+                "activity": activity,
+                "lifetime": lifetime,
+                "age": age,
+            }
+            row_vectors.append([row.get(name, 0.0) for name in feature_order])
+        if not row_vectors:
+            return []
+        features = np.asarray(row_vectors, dtype=float)
+        x = (features - model["mu"]) / model["sd"]
+        hidden = np.tanh(x @ model["W1"] + model["b1"])
+        scores = 1.0 / (1.0 + np.exp(-(hidden @ model["W2"] + model["b2"])[:, 0]))
+        ranked = sorted(
+            range(len(candidates)),
+            key=lambda index: (-float(scores[index]), _post_id(candidates[index].post)),
+        )[:limit]
+        return [
+            {
+                "post_id": _post_id(candidates[index].post),
+                "user_id": candidates[index].post.user_id,
+                "content": candidates[index].post.content,
+                "created_at": _as_utc(candidates[index].post.created_at).isoformat(),
+                "score": float(scores[index]),
+            }
+            for index in ranked
+        ]
 
     def get_feed(
         self,
