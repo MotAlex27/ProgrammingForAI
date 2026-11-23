@@ -438,6 +438,10 @@ def run_evaluation(db_path: Path, cutoff: datetime, seed: int, out_dir: Path) ->
                 handle.write(f"- 95% interval: [{group_interval[0]:.4f}, {group_interval[1]:.4f}]\n")
                 handle.write(f"- verdict: {_verdict(group_interval)}\n\n")
 
+        baseline_table.write_text(
+            baseline_table.read_text(encoding="utf-8").rstrip() + "\n",
+            encoding="utf-8",
+        )
         dashboard_path = out_dir / "dashboard.html"
         dashboard_path.write_text(
             build_dashboard_html(system_rows, valid_users, cutoff, seed, db_path, ROOT),
@@ -711,7 +715,8 @@ def fig_to_svg(fig) -> str:
     end = svg.rfind("</svg>")
     if start < 0 or end < start:
         raise EvaluationError("matplotlib did not produce a valid SVG chart")
-    return svg[start : end + len("</svg>")]
+    svg_content = svg[start : end + len("</svg>")]
+    return "\n".join(line.rstrip() for line in svg_content.splitlines()) + "\n"
 
 
 def _build_parser() -> argparse.ArgumentParser:

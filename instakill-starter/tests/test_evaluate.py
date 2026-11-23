@@ -122,7 +122,9 @@ def test_eval_is_deterministic(tmp_path):
     first_bytes = (first["csv_path"]).read_bytes()
     second_bytes = (second["csv_path"]).read_bytes()
     assert first_bytes == second_bytes
-    assert first["baseline_table"].read_bytes() == second["baseline_table"].read_bytes()
+    table_bytes = first["baseline_table"].read_bytes()
+    assert table_bytes == second["baseline_table"].read_bytes()
+    assert table_bytes.endswith(b"\n") and not table_bytes.endswith(b"\n\n")
 
 
 def test_snapshot_rejects_missing_event_timestamps(tmp_path):
@@ -232,5 +234,6 @@ def test_dashboard_has_baseline_table_and_intervals(tmp_path, monkeypatch):
     assert "95% interval" in html
     assert "<?xml" not in html
     assert "<svg" in html
+    assert all(line == line.rstrip() for line in html.splitlines())
     assert "Does learned beat the best baseline" in html
     assert "How does each strategy perform across user activity groups?" in html
