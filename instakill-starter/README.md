@@ -46,6 +46,18 @@ with `pytest` from this repository directory.
 
 The first startup downloads `sentence-transformers/all-MiniLM-L6-v2`; subsequent runs use the local model cache. No hosted inference service or vector database is used.
 
+## Week 7 offline evaluation
+
+The evaluation uses the MovieLens files already in the course repository and writes to a separate database, so it does not overwrite your normal `instakill.db`:
+
+```bash
+pip install -e ".[dev,eval]"
+python scripts/seed_movielens.py --db instakill-eval.db
+python scripts/evaluate.py --db instakill-eval.db --out reports
+```
+
+The seeder uses ratings of 4.0 or higher as timestamped likes, creates one post per rated movie, and derives follows from liked authors. The evaluator makes a time-safe snapshot, calls the feed service for `chronological`, `for_you`, and `learned`, and computes the evaluation-only `popularity` baseline. It writes `eval_results.csv`, `baseline_table.md`, and a self-contained `dashboard.html` in the output directory. NumPy is required by the learned scorer; install the `eval` extra for the plots.
+
 ## Milestones (see masterplan.md for full details)
 
 W1 Repo+API → W3 CRUD+DB → W4 Feed v0 → W7 Baseline+eval plan → W9 ML+pretrained feature → W11 Profile+optimize → W13 Feature freeze+E2E → W14 Red-team+Demo Day.

@@ -26,7 +26,7 @@ try:  # pragma: no cover - optional evaluation dependency
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-except Exception:  # pragma: no cover
+except ModuleNotFoundError:  # pragma: no cover
     plt = None
 
 
@@ -60,17 +60,16 @@ def parse_datetime(value: str | None) -> datetime:
 
 
 def _git_commit(repo_root: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except Exception:
-        return "unknown"
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "log", "-1", "--format=%H", "--", "scripts/evaluate.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     commit = result.stdout.strip()
-    return commit if commit else "unknown"
+    if not commit:
+        raise EvaluationError(f"no committed revision found for scripts/evaluate.py in {repo_root}")
+    return commit
 
 
 def database_fingerprint(path: Path) -> str:
@@ -86,22 +85,21 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
     return any(row[1] == column for row in rows)
 
 
-def _resolve_like_time_column(conn: sqlite3.Connection) -> str | None:
-    return "created_at" if _table_has_column(conn, "like", "created_at") else None
-
-
 def _infer_cutoff(conn: sqlite3.Connection) -> datetime:
-    timestamps: list[datetime] = []
-    if _table_has_column(conn, "like", "created_at"):
-        rows = conn.execute("SELECT created_at FROM like WHERE created_at IS NOT NULL").fetchall()
-        for row in rows:
-            timestamps.append(parse_datetime(row[0]))
-    else:
-        rows = conn.execute(
-            "SELECT DISTINCT p.created_at FROM like l JOIN post p ON p.id = l.post_id WHERE p.created_at IS NOT NULL"
-        ).fetchall()
-        for row in rows:
-            timestamps.append(parse_datetime(row[0]))
+    if not _table_has_column(conn, "like", "created_at"):
+        raise EvaluationError(
+            "offline evaluation requires like.created_at timestamps; seed or migrate the database"
+        )
+    if not _table_has_column(conn, "post", "created_at"):
+        raise EvaluationError(
+            "offline evaluation requires post.created_at timestamps"
+        )
+    rows = conn.execute("SELECT created_at FROM like").fetchall()
+    if any(row[0] is None for row in rows):
+        raise EvaluationError(
+            "offline evaluation cannot infer a cutoff while like.created_at values are missing"
+        )
+    timestamps = [parse_datetime(row[0]) for row in rows]
     if not timestamps:
         raise EvaluationError("could not infer a cutoff from the database; pass --cutoff explicitly")
     timestamps.sort()
@@ -124,26 +122,6 @@ def _safe_mean(values: Iterable[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
-def _before_cutoff_sql(table: str, cutoff: str, time_column: str | None) -> str:
-    if time_column is not None:
-        return f"{table}.{time_column} < '{cutoff}'"
-    if table == "post":
-        return f"post.created_at < '{cutoff}'"
-    if table == "like":
-        return f"post.created_at < '{cutoff}'"
-    return "1 = 1"
-
-
-def _after_cutoff_sql(table: str, cutoff: str, time_column: str | None) -> str:
-    if time_column is not None:
-        return f"{table}.{time_column} >= '{cutoff}'"
-    if table == "post":
-        return f"post.created_at >= '{cutoff}'"
-    if table == "like":
-        return f"post.created_at >= '{cutoff}'"
-    return "1 = 1"
-
-
 def _snapshot_path_for(db_path: Path) -> Path:
     return db_path.parent / f"{db_path.stem}-snapshot-{uuid.uuid4().hex}{db_path.suffix}"
 
@@ -163,61 +141,63 @@ def build_snapshot(source_db: Path, cutoff: datetime) -> Path:
         post_has_created = _table_has_column(conn, "post", "created_at")
         like_has_created = _table_has_column(conn, "like", "created_at")
         follow_has_created = _table_has_column(conn, "follow", "created_at")
-
-        if post_has_created:
-            conn.execute("DELETE FROM post WHERE created_at >= ?", (cut_text,))
-        if like_has_created:
-            conn.execute("DELETE FROM like WHERE created_at >= ?", (cut_text,))
-        elif post_has_created:
-            conn.execute(
-                "DELETE FROM like WHERE post_id IN (SELECT id FROM post WHERE created_at >= ?)",
-                (cut_text,),
+        if not post_has_created or not like_has_created:
+            raise EvaluationError(
+                "offline evaluation requires created_at timestamps on post and like"
             )
-        if follow_has_created:
-            conn.execute("DELETE FROM follow WHERE created_at >= ?", (cut_text,))
+        if not follow_has_created:
+            conn.execute("ALTER TABLE follow ADD COLUMN created_at TEXT")
+        for table in ("post", "like"):
+            null_count = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE created_at IS NULL OR julianday(created_at) IS NULL"
+            ).fetchone()[0]
+            if null_count:
+                raise EvaluationError(
+                    f"offline evaluation requires valid {table}.created_at values; found {null_count} missing or invalid"
+                )
+
+        conn.execute(
+            """
+            DELETE FROM like
+            WHERE julianday(created_at) >= julianday(?)
+               OR post_id IN (
+                    SELECT id FROM post
+                    WHERE julianday(created_at) >= julianday(?)
+               )
+            """,
+            (cut_text, cut_text),
+        )
+        conn.execute("DELETE FROM post WHERE julianday(created_at) >= julianday(?)", (cut_text,))
+        conn.execute("DELETE FROM follow")
+        conn.execute(
+            """
+            INSERT INTO follow (user_id, followed_user_id, created_at)
+            SELECT l.user_id, p.user_id, MIN(l.created_at)
+            FROM like l
+            JOIN post p ON p.id = l.post_id
+            WHERE l.user_id != p.user_id
+            GROUP BY l.user_id, p.user_id
+            """
+        )
         conn.commit()
 
     return snapshot
 
 
 def _user_likes_before_cutoff(conn: sqlite3.Connection, cutoff: datetime) -> dict[int, int]:
-    cutoff_text = isoformat_utc(cutoff).replace("+00:00", "Z")
-    like_time_col = _resolve_like_time_column(conn)
-    if like_time_col:
-        rows = conn.execute(
-            "SELECT l.user_id, COUNT(*) AS count FROM like l JOIN post p ON p.id = l.post_id WHERE l.created_at < ? GROUP BY l.user_id",
-            (cutoff_text,),
-        ).fetchall()
-        return {row["user_id"]: row["count"] for row in rows}
-
+    cutoff_text = isoformat_utc(cutoff)
     rows = conn.execute(
-        "SELECT l.user_id, COUNT(*) AS count FROM like l JOIN post p ON p.id = l.post_id WHERE p.created_at < ? GROUP BY l.user_id",
-        (cutoff_text,),
+        """
+        SELECT l.user_id, COUNT(*) AS count
+        FROM like l
+        JOIN post p ON p.id = l.post_id
+        WHERE julianday(l.created_at) < julianday(?)
+          AND julianday(p.created_at) < julianday(?)
+        GROUP BY l.user_id
+        """,
+        (cutoff_text, cutoff_text),
     ).fetchall()
     return {row["user_id"]: row["count"] for row in rows}
-
-
-def _user_like_counts_after_cutoff(conn: sqlite3.Connection, cutoff: datetime) -> dict[int, set[int]]:
-    cutoff_text = isoformat_utc(cutoff).replace("+00:00", "Z")
-    like_time_col = _resolve_like_time_column(conn)
-    if like_time_col:
-        rows = conn.execute(
-            "SELECT user_id, post_id FROM like WHERE created_at >= ?",
-            (cutoff_text,),
-        ).fetchall()
-        aggregated: dict[int, set[int]] = {}
-        for row in rows:
-            aggregated.setdefault(row["user_id"], set()).add(row["post_id"])
-        return aggregated
-
-    rows = conn.execute(
-        "SELECT l.user_id, l.post_id FROM like l JOIN post p ON p.id = l.post_id WHERE p.created_at >= ?",
-        (cutoff_text,),
-    ).fetchall()
-    aggregated: dict[int, set[int]] = {}
-    for row in rows:
-        aggregated.setdefault(row["user_id"], set()).add(row["post_id"])
-    return aggregated
 
 
 def _ndcg_at_10(ranked_post_ids: Iterable[int], relevant_post_ids: set[int]) -> float:
@@ -239,8 +219,20 @@ def _populate_service_service_path() -> str:
 
 def _simulate_popularity(user_id: int, conn: sqlite3.Connection, cutoff: datetime, limit: int = 10) -> list[dict[str, int | str | float]]:
     rows = conn.execute(
-        "SELECT p.id, p.user_id, p.content, p.created_at, COUNT(l.post_id) AS like_count FROM post p LEFT JOIN like l ON l.post_id = p.id WHERE p.user_id != ? GROUP BY p.id ORDER BY like_count DESC, p.id ASC LIMIT ?",
-        (user_id, limit),
+        """
+        SELECT p.id, p.user_id, p.content, p.created_at, COUNT(l.post_id) AS like_count
+        FROM post p
+        LEFT JOIN like l ON l.post_id = p.id
+        WHERE p.user_id != ?
+          AND NOT EXISTS (
+              SELECT 1 FROM like own_like
+              WHERE own_like.user_id = ? AND own_like.post_id = p.id
+          )
+        GROUP BY p.id
+        ORDER BY like_count DESC, p.id ASC
+        LIMIT ?
+        """,
+        (user_id, user_id, limit),
     ).fetchall()
     return [
         {
@@ -254,41 +246,93 @@ def _simulate_popularity(user_id: int, conn: sqlite3.Connection, cutoff: datetim
     ]
 
 
+def _strategy_scores(
+    rows: list[dict[str, object]], strategy: str, user_group: str | None = None
+) -> dict[int, float]:
+    return {
+        int(row["user_id"]): float(row["ndcg_at_10"])
+        for row in rows
+        if row["strategy"] == strategy
+        and (user_group is None or row["user_group"] == user_group)
+    }
+
+
+def _best_baseline_comparison(
+    rows: list[dict[str, object]], user_group: str | None = None
+) -> tuple[str | None, list[float]]:
+    baseline_scores = {
+        strategy: _strategy_scores(rows, strategy, user_group)
+        for strategy in BASELINE_STRATEGIES
+    }
+    available = {
+        strategy: scores
+        for strategy, scores in baseline_scores.items()
+        if scores
+    }
+    if not available:
+        return None, []
+
+    best_strategy = max(
+        available,
+        key=lambda strategy: (_safe_mean(list(available[strategy].values())), strategy),
+    )
+    learned_scores = _strategy_scores(rows, "learned", user_group)
+    selected_baseline = available[best_strategy]
+    deltas = [
+        learned_scores[user_id] - selected_baseline[user_id]
+        for user_id in sorted(learned_scores.keys() & selected_baseline.keys())
+    ]
+    return best_strategy, deltas
+
+
+def _verdict(interval: tuple[float, float]) -> str:
+    if interval[0] > 0:
+        return "wins"
+    if interval[1] < 0:
+        return "loses"
+    return "unclear"
+
+
 def run_evaluation(db_path: Path, cutoff: datetime, seed: int, out_dir: Path) -> dict[str, object]:
     snapshot = build_snapshot(db_path, cutoff)
+    cutoff_text = isoformat_utc(cutoff)
+    with sqlite3.connect(snapshot) as snapshot_conn:
+        snapshot_conn.row_factory = sqlite3.Row
+        prior_counts = _user_likes_before_cutoff(snapshot_conn, cutoff)
 
+    relevant_by_user: dict[int, set[int]] = {}
     with sqlite3.connect(db_path) as source_conn:
         source_conn.row_factory = sqlite3.Row
-        like_time = _resolve_like_time_column(source_conn)
-        before_query = "SELECT DISTINCT user_id FROM like WHERE created_at < ?" if like_time else "SELECT DISTINCT l.user_id FROM like l JOIN post p ON p.id = l.post_id WHERE p.created_at < ?"
-        after_query = "SELECT DISTINCT user_id, post_id FROM like WHERE created_at >= ?" if like_time else "SELECT DISTINCT l.user_id, l.post_id FROM like l JOIN post p ON p.id = l.post_id WHERE p.created_at >= ?"
-
-        users_before = {row[0] for row in source_conn.execute(before_query, (isoformat_utc(cutoff).replace("+00:00", "Z"),)).fetchall()}
-        users_after = {
-            row["user_id"]
-            for row in source_conn.execute(after_query, (isoformat_utc(cutoff).replace("+00:00", "Z"),)).fetchall()
-        }
-
-        relevant_by_user = {}
-        for row in source_conn.execute(after_query, (isoformat_utc(cutoff).replace("+00:00", "Z"),)).fetchall():
+        rows = source_conn.execute(
+            """
+            SELECT l.user_id, l.post_id
+            FROM like l
+            JOIN post p ON p.id = l.post_id
+            WHERE julianday(l.created_at) >= julianday(?)
+              AND julianday(p.created_at) < julianday(?)
+            """,
+            (cutoff_text, cutoff_text),
+        ).fetchall()
+        for row in rows:
             relevant_by_user.setdefault(row["user_id"], set()).add(row["post_id"])
 
-        prior_counts = _user_likes_before_cutoff(source_conn, cutoff)
-        valid_users = sorted(
-            {user_id for user_id in users_before if user_id in users_after and prior_counts.get(user_id, 0) >= 3 and len(relevant_by_user.get(user_id, set())) >= 1}
-        )
+    valid_users = sorted(
+        user_id
+        for user_id, count in prior_counts.items()
+        if count >= 3 and relevant_by_user.get(user_id)
+    )
 
     with sqlite3.connect(snapshot) as conn:
         conn.row_factory = sqlite3.Row
-        prior_counts_snapshot = _user_likes_before_cutoff(conn, cutoff)
         system_rows: list[dict[str, object]] = []
-        from app import db as app_db_module
-        original_db_path = app_db_module.database.DB_PATH
-        app_db_module.database.DB_PATH = snapshot
+        from app.db import database as app_database
+
+        original_db_path = app_database.DB_PATH
+        app_database.DB_PATH = snapshot
         try:
             for user_id in valid_users:
                 relevant = relevant_by_user.get(user_id, set())
-                user_group = _group_for_count(prior_counts_snapshot.get(user_id, prior_counts.get(user_id, 0)))
+                user_group = _group_for_count(prior_counts.get(user_id, 0))
                 for strategy in DEFAULT_STRATEGIES:
                     if strategy == "popularity":
                         ranked = _simulate_popularity(user_id, conn, cutoff, limit=10)
@@ -309,39 +353,40 @@ def run_evaluation(db_path: Path, cutoff: datetime, seed: int, out_dir: Path) ->
                         }
                     )
         finally:
-            app_db_module.database.DB_PATH = original_db_path
+            app_database.DB_PATH = original_db_path
 
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = out_dir / "eval_results.csv"
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["user_id", "strategy", "ndcg_at_10", "n_relevant", "user_group"])
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "user_id",
+                    "strategy",
+                    "ndcg_at_10",
+                    "n_relevant",
+                    "user_group",
+                ],
+            )
             writer.writeheader()
             for row in sorted(system_rows, key=lambda item: (int(item["user_id"]), str(item["strategy"]))):
                 writer.writerow(row)
 
-        baseline_summary: dict[str, dict[str, float | int]] = {}
+        strategy_summary: dict[str, dict[str, float | int | tuple[float, float]]] = {}
         for strategy in BASELINE_STRATEGIES:
             values = [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == strategy]
-            baseline_summary[strategy] = {
+            strategy_summary[strategy] = {
                 "mean": _safe_mean(values),
                 "interval": _bootstrap_interval(values, seed),
                 "n_users": len(values),
             }
-
         learned_values = [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned"]
-        best_baseline_name = max(BASELINE_STRATEGIES, key=lambda name: baseline_summary[name]["mean"])
-        baseline_best = [
-            max(float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] in BASELINE_STRATEGIES)
-            for row in system_rows
-            if row["strategy"] == "learned"
-        ]
-        learned_minus_baseline = []
-        for user_id in sorted({int(row["user_id"]) for row in system_rows if row["strategy"] == "learned"}):
-            learned_score = next(float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned" and int(row["user_id"]) == user_id)
-            baseline_score = max(
-                float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] in BASELINE_STRATEGIES and int(row["user_id"]) == user_id
-            )
-            learned_minus_baseline.append(learned_score - baseline_score)
+        strategy_summary["learned"] = {
+            "mean": _safe_mean(learned_values),
+            "interval": _bootstrap_interval(learned_values, seed),
+            "n_users": len(learned_values),
+        }
+        best_baseline_name, learned_minus_baseline = _best_baseline_comparison(system_rows)
 
         baseline_table = out_dir / "baseline_table.md"
         with baseline_table.open("w", encoding="utf-8") as handle:
@@ -354,59 +399,50 @@ def run_evaluation(db_path: Path, cutoff: datetime, seed: int, out_dir: Path) ->
             handle.write("| Strategy | Mean NDCG@10 | 95% interval | Users |\n")
             handle.write("|---|---:|---:|---:|\n")
             for strategy in DEFAULT_STRATEGIES:
-                values = [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == strategy]
-                if not values:
+                stats = strategy_summary[strategy]
+                if not stats["n_users"]:
                     continue
-                interval = _bootstrap_interval(values, seed)
+                interval = stats["interval"]
                 handle.write(
-                    f"| {strategy} | {mean(values):.4f} | [{interval[0]:.4f}, {interval[1]:.4f}] | {len(values)} |\n"
+                    f"| {strategy} | {stats['mean']:.4f} | [{interval[0]:.4f}, {interval[1]:.4f}] | {stats['n_users']} |\n"
                 )
             handle.write("\n")
             learned_interval = _bootstrap_interval(learned_minus_baseline, seed)
-            if learned_interval[0] > 0:
-                verdict = "wins"
-            elif learned_interval[1] < 0:
-                verdict = "loses"
-            else:
-                verdict = "unclear"
-            handle.write(f"## learned minus best baseline overall\n\n")
+            handle.write(
+                f"## learned minus best baseline overall"
+                f"{f' ({best_baseline_name})' if best_baseline_name else ''}\n\n"
+            )
             if learned_minus_baseline:
                 handle.write(f"- mean: {_safe_mean(learned_minus_baseline):.4f}\n")
                 handle.write(f"- 95% interval: [{learned_interval[0]:.4f}, {learned_interval[1]:.4f}]\n")
-                handle.write(f"- verdict: {verdict}\n\n")
+                handle.write(f"- verdict: {_verdict(learned_interval)}\n\n")
             else:
                 handle.write("- no learned-vs-baseline deltas available for this cutoff\n\n")
 
-            for group in sorted({str(row["user_group"]) for row in system_rows}):
-                group_values = [
-                    float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned" and row["user_group"] == group
-                ]
-                if not group_values:
+            groups = sorted(
+                {str(row["user_group"]) for row in system_rows},
+                key=("new", "casual", "regular", "power").index,
+            )
+            for group in groups:
+                best_group_baseline, baseline_group = _best_baseline_comparison(
+                    system_rows, group
+                )
+                if not baseline_group:
                     continue
-                baseline_group = []
-                for user_id in sorted({int(row["user_id"]) for row in system_rows if row["strategy"] == "learned" and row["user_group"] == group}):
-                    learned_score = next(float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned" and int(row["user_id"]) == user_id)
-                    baseline_score = max(
-                        float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] in BASELINE_STRATEGIES and int(row["user_id"]) == user_id
-                    )
-                    baseline_group.append(learned_score - baseline_score)
                 group_interval = _bootstrap_interval(baseline_group, seed)
-                if group_interval[0] > 0:
-                    verdict = "wins"
-                elif group_interval[1] < 0:
-                    verdict = "loses"
-                else:
-                    verdict = "unclear"
-                handle.write(f"## learned minus best baseline for {group}\n\n")
-                if baseline_group:
-                    handle.write(f"- mean: {_safe_mean(baseline_group):.4f}\n")
-                    handle.write(f"- 95% interval: [{group_interval[0]:.4f}, {group_interval[1]:.4f}]\n")
-                    handle.write(f"- verdict: {verdict}\n\n")
-                else:
-                    handle.write("- no learned-vs-baseline deltas available for this group\n\n")
+                handle.write(
+                    f"## learned minus best baseline for {group}"
+                    f"{f' ({best_group_baseline})' if best_group_baseline else ''}\n\n"
+                )
+                handle.write(f"- mean: {_safe_mean(baseline_group):.4f}\n")
+                handle.write(f"- 95% interval: [{group_interval[0]:.4f}, {group_interval[1]:.4f}]\n")
+                handle.write(f"- verdict: {_verdict(group_interval)}\n\n")
 
         dashboard_path = out_dir / "dashboard.html"
-        dashboard_path.write_text(build_dashboard_html(system_rows, valid_users, cutoff, seed, db_path, ROOT), encoding="utf-8")
+        dashboard_path.write_text(
+            build_dashboard_html(system_rows, valid_users, cutoff, seed, db_path, ROOT),
+            encoding="utf-8",
+        )
 
         return {
             "snapshot": snapshot,
@@ -423,12 +459,12 @@ def _bootstrap_interval(values: list[float], seed: int) -> tuple[float, float]:
         return (0.0, 0.0)
     import random
 
-    random.seed(seed)
+    rng = random.Random(seed)
     draws = []
     for _ in range(400):
         sample = []
         for _ in values:
-            sample.append(values[random.randrange(len(values))])
+            sample.append(values[rng.randrange(len(values))])
         draws.append(mean(sample))
     draws.sort()
     low = draws[int(0.025 * len(draws))]
@@ -436,71 +472,187 @@ def _bootstrap_interval(values: list[float], seed: int) -> tuple[float, float]:
     return (low, high)
 
 
-def build_dashboard_html(system_rows: list[dict[str, object]], valid_users: list[int], cutoff: datetime, seed: int, db_path: Path, repo_root: Path) -> str:
-    strategy_means = {}
-    for strategy in DEFAULT_STRATEGIES:
-        values = [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == strategy]
-        if values:
-            strategy_means[strategy] = _safe_mean(values)
+STRATEGY_COLORS = {
+    "chronological": "#9AA6BD",
+    "popularity": "#F7A30F",
+    "for_you": "#10ADB6",
+    "learned": "#0B2F63",
+}
 
-    groups = sorted({str(row["user_group"]) for row in system_rows})
-    chart2_results = []
-    for group in groups:
-        learned_scores = [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned" and row["user_group"] == group]
-        baseline_scores = []
-        for user_id in sorted({int(row["user_id"]) for row in system_rows if row["strategy"] == "learned" and row["user_group"] == group}):
-            learned_score = next(float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == "learned" and int(row["user_id"]) == user_id)
-            baseline_score = max(
-                float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] in BASELINE_STRATEGIES and int(row["user_id"]) == user_id
+
+def build_dashboard_html(
+    system_rows: list[dict[str, object]],
+    valid_users: list[int],
+    cutoff: datetime,
+    seed: int,
+    db_path: Path,
+    repo_root: Path,
+) -> str:
+    if plt is None:
+        raise EvaluationError(
+            "matplotlib is required for dashboard charts; install the eval extra"
+        )
+
+    groups = sorted(
+        {str(row["user_group"]) for row in system_rows},
+        key=("new", "casual", "regular", "power").index,
+    )
+    strategy_stats: dict[str, tuple[float, tuple[float, float], int]] = {}
+    for strategy in DEFAULT_STRATEGIES:
+        values = [
+            float(row["ndcg_at_10"])
+            for row in system_rows
+            if row["strategy"] == strategy
+        ]
+        if values:
+            strategy_stats[strategy] = (
+                _safe_mean(values),
+                _bootstrap_interval(values, seed),
+                len(values),
             )
-            baseline_scores.append(learned_score - baseline_score)
-        if baseline_scores:
-            chart2_results.append((group, _safe_mean(baseline_scores)))
+
+    baseline_table = [
+        "<table><thead><tr><th>Strategy</th><th>Mean NDCG@10</th>"
+        "<th>95% interval</th><th>Users</th></tr></thead><tbody>"
+    ]
+    for strategy in DEFAULT_STRATEGIES:
+        if strategy not in strategy_stats:
+            continue
+        score, interval, count = strategy_stats[strategy]
+        baseline_table.append(
+            f"<tr><td>{strategy}</td><td>{score:.4f}</td>"
+            f"<td>[{interval[0]:.4f}, {interval[1]:.4f}]</td><td>{count}</td></tr>"
+        )
+    baseline_table.append("</tbody></table>")
+
+    overall_baseline, overall_deltas = _best_baseline_comparison(system_rows)
+    comparisons = [
+        ("overall", overall_baseline, overall_deltas, _bootstrap_interval(overall_deltas, seed))
+    ]
+    chart2_results: list[tuple[str, str, list[float], tuple[float, float]]] = []
+    for group in groups:
+        best_baseline, deltas = _best_baseline_comparison(system_rows, group)
+        if deltas:
+            interval = _bootstrap_interval(deltas, seed)
+            comparisons.append((group, best_baseline, deltas, interval))
+            chart2_results.append((group, best_baseline or "", deltas, interval))
+    comparison_html = []
+    for label, baseline, deltas, interval in comparisons:
+        if deltas:
+            comparison_html.append(
+                f"<p><strong>{label}</strong> (baseline: {baseline}): "
+                f"mean delta {_safe_mean(deltas):.4f}, "
+                f"95% interval [{interval[0]:.4f}, {interval[1]:.4f}], "
+                f"{_verdict(interval)}.</p>"
+            )
 
     if plt is not None:
+        from matplotlib.colors import TwoSlopeNorm
+
         fig, ax = plt.subplots(figsize=(8, 4))
-        labels = list(strategy_means)
-        values = [strategy_means[label] for label in labels]
-        ax.bar(labels, values, color=["#9AA6BD", "#F7A30F", "#10ADB6", "#0B2F63"][: len(labels)])
-        ax.axhline(0, color="black", linewidth=1)
-        ax.set_title("Which strategy wins on mean NDCG@10?")
-        ax.set_ylabel("Mean NDCG@10")
+        labels = list(strategy_stats)
+        values = [strategy_stats[label][0] for label in labels]
+        lower = [
+            max(0.0, score - strategy_stats[label][1][0])
+            for label, score in zip(labels, values)
+        ]
+        upper = [
+            max(0.0, strategy_stats[label][1][1] - score)
+            for label, score in zip(labels, values)
+        ]
+        ax.bar(labels, values, color=[STRATEGY_COLORS[label] for label in labels])
+        if labels:
+            ax.errorbar(
+                labels, values, yerr=[lower, upper], fmt="none", ecolor="black", capsize=4
+            )
+        ax.set_ylim(0, 1.05)
+        ax.set_title("Which strategy has the highest mean NDCG@10?")
+        ax.set_ylabel("Mean NDCG@10 (95% user-bootstrap interval)")
         ax.set_xlabel("Strategy")
         fig.tight_layout()
         chart1_svg = fig_to_svg(fig)
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(8, 4))
-        bar_labels = [item[0] for item in chart2_results]
-        bar_values = [item[1] for item in chart2_results]
-        ax.bar(bar_labels, bar_values, color="salmon")
+        labels = [item[0] for item in chart2_results]
+        values = [_safe_mean(item[2]) for item in chart2_results]
+        lower = [
+            max(0.0, value - item[3][0])
+            for item, value in zip(chart2_results, values)
+        ]
+        upper = [
+            max(0.0, item[3][1] - value)
+            for item, value in zip(chart2_results, values)
+        ]
+        bound = max(
+            [abs(value) for value in values]
+            + [abs(value) for item in chart2_results for value in item[3]]
+            + [1e-9]
+        )
+        color_norm = TwoSlopeNorm(vmin=-bound, vcenter=0, vmax=bound)
+        color_map = plt.get_cmap("RdBu_r")
+        colors = [color_map(color_norm(value)) for value in values]
+        ax.bar(labels, values, color=colors)
+        if labels:
+            ax.errorbar(
+                labels, values, yerr=[lower, upper], fmt="none", ecolor="black", capsize=4
+            )
         ax.axhline(0, color="black", linewidth=1)
-        ax.set_title("How much does learned beat the baseline by user group?")
-        ax.set_ylabel("Learned - best baseline")
-        ax.set_xlabel("User group")
+        ax.set_title("Does learned beat the best baseline in each user group?")
+        ax.set_ylabel("Learned minus best baseline (95% paired interval)")
+        ax.set_xlabel("User activity group")
         fig.tight_layout()
         chart2_svg = fig_to_svg(fig)
         plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        strategy_labels = ["chronological", "popularity", "for_you", "learned"]
-        box_values = [
-            [float(row["ndcg_at_10"]) for row in system_rows if row["strategy"] == label]
-            for label in strategy_labels
-        ]
-        box = ax.boxplot(box_values)
-        ax.set_xticks([1, 2, 3, 4])
-        ax.set_xticklabels(strategy_labels)
-        ax.set_title("Distribution of per-user performance")
-        ax.set_ylabel("NDCG@10")
+        fig, ax = plt.subplots(figsize=(9, 4))
+        width = 0.18
+        for strategy_index, strategy in enumerate(DEFAULT_STRATEGIES):
+            centers = [
+                index + (strategy_index - (len(DEFAULT_STRATEGIES) - 1) / 2) * width
+                for index in range(len(groups))
+            ]
+            means: list[float] = []
+            lower: list[float] = []
+            upper: list[float] = []
+            for group in groups:
+                values = [
+                    float(row["ndcg_at_10"])
+                    for row in system_rows
+                    if row["strategy"] == strategy and row["user_group"] == group
+                ]
+                score = _safe_mean(values)
+                interval = _bootstrap_interval(values, seed)
+                means.append(score)
+                lower.append(max(0.0, score - interval[0]))
+                upper.append(max(0.0, interval[1] - score))
+            if groups:
+                ax.bar(
+                    centers,
+                    means,
+                    width,
+                    color=STRATEGY_COLORS[strategy],
+                    label=strategy,
+                )
+                ax.errorbar(
+                    centers,
+                    means,
+                    yerr=[lower, upper],
+                    fmt="none",
+                    ecolor="black",
+                    capsize=3,
+                )
+        ax.set_xticks(list(range(len(groups))))
+        ax.set_xticklabels(groups)
+        ax.set_ylim(0, 1.05)
+        ax.set_title("How does each strategy perform across user activity groups?")
+        ax.set_ylabel("Mean NDCG@10 (95% user-bootstrap interval)")
+        ax.set_xlabel("User activity group")
+        if groups:
+            ax.legend()
         fig.tight_layout()
         chart3_svg = fig_to_svg(fig)
         plt.close(fig)
-    else:
-        chart1_svg = "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='220'><text x='20' y='30'>strategy chart unavailable without matplotlib</text></svg>"
-        chart2_svg = "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='220'><text x='20' y='30'>group chart unavailable without matplotlib</text></svg>"
-        chart3_svg = "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='220'><text x='20' y='30'>distribution chart unavailable without matplotlib</text></svg>"
-
     html = f"""<!doctype html>
 <html lang=\"en\">
 <head><meta charset=\"utf-8\"><title>InstaKill Evaluation Dashboard</title>
@@ -508,6 +660,8 @@ def build_dashboard_html(system_rows: list[dict[str, object]], valid_users: list
 body {{ font-family: Arial, sans-serif; margin: 2rem; color: #222; }}
 .card {{ margin: 1rem 0; border: 1px solid #ddd; padding: 1rem; border-radius: 8px; }}
 code {{ background: #f2f2f2; padding: 0.1rem 0.2rem; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #ddd; padding: 0.5rem; text-align: left; }}
 </style>
 </head>
 <body>
@@ -523,15 +677,20 @@ code {{ background: #f2f2f2; padding: 0.1rem 0.2rem; }}
 </ul>
 </div>
 <div class=\"card\">
-<h2>Question: Which strategy wins on mean NDCG@10?</h2>
+<h2>Baseline table and paired comparisons</h2>
+{''.join(baseline_table)}
+{''.join(comparison_html)}
+</div>
+<div class=\"card\">
+<h2>Question: Which strategy has the highest mean NDCG@10?</h2>
 {chart1_svg}
 </div>
 <div class=\"card\">
-<h2>Question: How much does learned beat the best baseline by user group?</h2>
+<h2>Question: Does learned beat the best baseline in each user group?</h2>
 {chart2_svg}
 </div>
 <div class=\"card\">
-<h2>Question: How spread out are per-user scores?</h2>
+<h2>Question: How does each strategy perform across user activity groups?</h2>
 {chart3_svg}
 </div>
 </body>
@@ -542,12 +701,17 @@ code {{ background: #f2f2f2; padding: 0.1rem 0.2rem; }}
 
 def fig_to_svg(fig) -> str:
     if plt is None:
-        return "<svg />"
+        raise EvaluationError("matplotlib is required to generate dashboard charts")
     from io import BytesIO
 
     buffer = BytesIO()
     fig.savefig(buffer, format="svg")
-    return buffer.getvalue().decode("utf-8")
+    svg = buffer.getvalue().decode("utf-8")
+    start = svg.find("<svg")
+    end = svg.rfind("</svg>")
+    if start < 0 or end < start:
+        raise EvaluationError("matplotlib did not produce a valid SVG chart")
+    return svg[start : end + len("</svg>")]
 
 
 def _build_parser() -> argparse.ArgumentParser:
