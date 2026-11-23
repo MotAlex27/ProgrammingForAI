@@ -15,3 +15,8 @@ The first week has no Lightning Demos (there's no previous challenge to present)
 - Don't solve the full challenge in live coding — show only the mechanics (how to load the model, how to inspect an output), not the solution (students must find the 5 disagreements themselves).
 - Remind students of the compute policy: CPU is a guaranteed fallback, but if someone has a GPU available (local or Colab), they can use it — it's not forbidden.
 - Announce the lightning-talk bonus rule from week one (+0.25/presentation, max +1.00), effective from W2.
+
+## Week 1 delivery status — complete
+
+- [x] **Lab challenge** — the notebook runs on CPU, documents five model/data disagreements with dataset text resolved at runtime, passes its acceptance check, and includes the `RESULTS` block. The saved notebook output contains no review text.
+- [x] **InstaKill** — the repository has an initial commit (`ae13740`), and `GET /health` passes its test (`pytest tests/test_health.py`).
