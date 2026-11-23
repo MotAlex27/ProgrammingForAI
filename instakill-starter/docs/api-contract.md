@@ -131,4 +131,4 @@ When implemented, `200 OK` will return the post when it exists and belongs to th
 - `422 Unprocessable Entity` when either path parameter is not a positive integer.
 - `404 Not Found` when the user or post does not exist, or when the post belongs to a different user.
 
-Expected errors are `422 Unprocessable Entity` for invalid path parameters and `404 Not Found` when the user or post does not exist, or when the post belongs to a different user. Using the same `404` response avoids revealing posts through a nested URL. This endpoint is not implemented.
+When implemented, map an ownership mismatch from the application service to the same `404` as a missing user or post; this avoids revealing whether a post exists. This endpoint is not implemented.
